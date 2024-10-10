@@ -187,7 +187,7 @@ class GPT2Attention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.lth_int_dim, self.num_heads * self.lth_final_dim)
             )
-        print("LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
+            print("LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
                           self.add_lth, self.lth_hard_inference, self.lth_int_dim,
                           self.lth_final_dim,
                           self.lth_bit_thold, self.lth_intended_top_k ))
