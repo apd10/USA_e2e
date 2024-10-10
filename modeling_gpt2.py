@@ -171,6 +171,7 @@ class GPT2Attention(nn.Module):
             self.lth_final_dim = config.lth_final_dim
             self.lth_bit_thold = config.lth_bit_thold
             self.lth_intended_top_k = config.lth_intended_top_k
+            self.lth_hard_inference = config.lth_hard_inference 
 
             self.learning_to_hash_transformation_k = nn.Sequential(
                 nn.Linear(self.embed_dim, self.lth_int_dim),
@@ -186,13 +187,25 @@ class GPT2Attention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.lth_int_dim, self.num_heads * self.lth_final_dim)
             )
+        print("LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
+                          self.add_lth, self.lth_hard_inference, self.lth_int_dim,
+                          self.lth_final_dim,
+                          self.lth_bit_thold, self.lth_intended_top_k ))
 
     
     def give_lth_score(self, hidden_states):
+
         Q = self.learning_to_hash_transformation_q(hidden_states)
         K = self.learning_to_hash_transformation_k(hidden_states)
-        Q = nn.functional.tanh(Q)
-        K = nn.functional.tanh(K)
+
+
+        if self.lth_hard_inference and (not self.training):
+            Q = torch.sign(Q)
+            K = torch.sign(K)
+        else:
+            Q = nn.functional.tanh(Q)
+            K = nn.functional.tanh(K)
+        
         Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
         K = self._split_heads(K, self.num_heads, self.lth_final_dim)
         bsz, _, q_seq_len, _ = Q.size()
@@ -207,10 +220,14 @@ class GPT2Attention(nn.Module):
         span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
                                  '(b h) t s -> b h t s', h=self.num_heads)
         
-        span_scores = torch.sigmoid(span_scores)
+        if self.lth_hard_inference and (not self.training):
+            span_scores = (span_scores - self.lth_final_dim * self.lth_bit_thold  > 0).type(span_scores.dtype)
+        else:
+            span_scores = torch.sigmoid(span_scores - self.lth_final_dim * self.lth_bit_thold)
+        #else:
 
         # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
-        span_scores = span_scores / torch.sum(span_scores, dim=-1, keepdim=True)
+        span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
 
         span_scores = torch.clip(self.lth_intended_top_k * span_scores, max=1.0)
         return span_scores
