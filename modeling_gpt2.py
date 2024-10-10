@@ -207,7 +207,7 @@ class GPT2Attention(nn.Module):
         span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
                                  '(b h) t s -> b h t s', h=self.num_heads)
         
-        span_scores = torch.sigmoid(span_scores - self.lth_final_dim * self.lth_bit_thold)
+        span_scores = torch.sigmoid(span_scores)
 
         # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
         span_scores = span_scores / torch.sum(span_scores, dim=-1, keepdim=True)

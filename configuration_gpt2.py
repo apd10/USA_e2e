@@ -164,7 +164,7 @@ class GPT2Config(PretrainedConfig):
         lth_final_dim=24,
         lth_bit_thold=0.1,
         lth_intended_top_k=10,
-	    lth_hard_inference=False,
+        lth_hard_inference=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -193,7 +193,7 @@ class GPT2Config(PretrainedConfig):
         self.lth_final_dim=lth_final_dim
         self.lth_bit_thold=lth_bit_thold
         self.lth_intended_top_k=lth_intended_top_k
-	    self.lth_hard_inference=lth_hard_inference
+        self.lth_hard_inference=lth_hard_inference
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
