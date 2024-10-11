@@ -166,12 +166,16 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = set()
 
         self.add_lth = config.add_lth
+        self.exp_nonlinear_transform = config.exp_nonlinear_transform
         if self.add_lth:
+            self.lth_tempering = config.lth_tempering
             self.lth_start_temp = config.lth_start_temp
             self.lth_end_temp = config.lth_end_temp
             self.lth_temp_steps = config.lth_temp_steps      
             self.lth_step_counter = 0
             self.lth_temperature = config.lth_start_temp
+            if not self.lth_temperature and self.lth_temperature != 1:
+                print("WARNING: temperature set to {} while not tempering".format(self.lth_temperature))
 
 
             self.lth_int_dim = config.lth_int_dim
@@ -195,10 +199,30 @@ class GPT2Attention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.lth_int_dim, self.num_heads * self.lth_final_dim)
             )
-            print("!!LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
-                          self.add_lth, self.lth_hard_inference, self.lth_int_dim,
-                          self.lth_final_dim,
-                          self.lth_bit_thold, self.lth_intended_top_k ))
+            if self.layer_idx == 0:
+                print("!!LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
+                              self.add_lth, self.lth_hard_inference, self.lth_int_dim,
+                              self.lth_final_dim,
+                              self.lth_bit_thold, self.lth_intended_top_k ))
+                print("!!LTH params [tempering:{} start:{} end:{} steps:{}]  ".format(
+                                self.lth_tempering, self.lth_start_temp, self.lth_end_temp, self.lth_temp_steps
+                               ))
+        elif self.exp_nonlinear_transform:
+            self.nl_int_dim = config.nl_int_dim
+            self.nonlinear_transformation_k = nn.Sequential(
+                nn.Linear(self.embed_dim, self.nl_int_dim),
+                nn.SiLU(),
+                nn.Linear(self.nl_int_dim, self.nl_int_dim),
+                nn.SiLU(),
+                nn.Linear(self.nl_int_dim, self.embed_dim)
+            )
+            self.nonlinear_transformation_q = nn.Sequential(
+                nn.Linear(self.embed_dim, self.nl_int_dim),
+                nn.SiLU(),
+                nn.Linear(self.nl_int_dim, self.nl_int_dim),
+                nn.SiLU(),
+                nn.Linear(self.nl_int_dim, self.embed_dim)
+            )
 
     def get_lth_training_temp(self):
         assert (self.training)
@@ -214,8 +238,8 @@ class GPT2Attention(nn.Module):
         return self.lth_temperature
     
     def give_lth_score(self, hidden_states):
-        T = 1
-        if self.training:
+        T = self.lth_temperature
+        if self.training and self.lth_tempering:
             T = self.get_lth_training_temp()
 
         Q = self.learning_to_hash_transformation_q(hidden_states)
@@ -618,6 +642,10 @@ class GPT2SdpaAttention(GPT2Attention):
             attention_mask = encoder_attention_mask
         else:
             query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+
+        if self.exp_nonlinear_transform:
+            query = self.nonlinear_transformation_q(hidden_states)
+            key = self.nonlinear_transformation_k(hidden_states)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
