@@ -167,7 +167,15 @@ class GPT2Attention(nn.Module):
 
         self.add_lth = config.add_lth
         if self.add_lth:
+            self.lth_start_temp = config.lth_start_temp
+            self.lth_end_temp = config.lth_end_temp
+            self.lth_temp_steps = config.lth_temp_steps      
+            self.lth_step_counter = 0
+            self.lth_temperature = config.lth_start_temp
+
+
             self.lth_int_dim = config.lth_int_dim
+            
             self.lth_final_dim = config.lth_final_dim
             self.lth_bit_thold = config.lth_bit_thold
             self.lth_intended_top_k = config.lth_intended_top_k
@@ -187,13 +195,28 @@ class GPT2Attention(nn.Module):
                 nn.SiLU(),
                 nn.Linear(self.lth_int_dim, self.num_heads * self.lth_final_dim)
             )
-            print("LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
+            print("!!LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
                           self.add_lth, self.lth_hard_inference, self.lth_int_dim,
                           self.lth_final_dim,
                           self.lth_bit_thold, self.lth_intended_top_k ))
 
+    def get_lth_training_temp(self):
+        assert (self.training)
+        self.lth_step_counter += 1
+
+        if (self.lth_step_counter % 100 == 0):
+            alpha = max(0, self.lth_temp_steps -self.lth_step_counter) / self.lth_temp_steps
+            new_temperature = alpha * self.lth_start_temp + (1 - alpha) * self.lth_end_temp
+            if self.layer_idx == 0:
+                print("Setting temperature: {} -> {}".format(self.lth_temperature, new_temperature, flush=True))
+
+            self.lth_temperature = new_temperature
+        return self.lth_temperature
     
     def give_lth_score(self, hidden_states):
+        T = 1
+        if self.training:
+            T = self.get_lth_training_temp()
 
         Q = self.learning_to_hash_transformation_q(hidden_states)
         K = self.learning_to_hash_transformation_k(hidden_states)
@@ -203,8 +226,8 @@ class GPT2Attention(nn.Module):
             Q = torch.sign(Q)
             K = torch.sign(K)
         else:
-            Q = nn.functional.tanh(Q)
-            K = nn.functional.tanh(K)
+            Q = nn.functional.tanh(Q*T)
+            K = nn.functional.tanh(K*T)
         
         Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
         K = self._split_heads(K, self.num_heads, self.lth_final_dim)
@@ -223,13 +246,13 @@ class GPT2Attention(nn.Module):
         if self.lth_hard_inference and (not self.training):
             span_scores = (span_scores - self.lth_final_dim * self.lth_bit_thold  > 0).type(span_scores.dtype)
         else:
-            span_scores = torch.sigmoid(span_scores - self.lth_final_dim * self.lth_bit_thold)
+            span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold)*T)
         #else:
 
         # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
         span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
 
-        span_scores = torch.clip(self.lth_intended_top_k * span_scores, max=1.0)
+        span_scores = self.lth_intended_top_k * span_scores
         return span_scores
 
 
