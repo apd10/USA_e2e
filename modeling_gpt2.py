@@ -64,6 +64,25 @@ _CHECKPOINT_FOR_DOC = "openai-community/gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
 
 
+import torch
+
+class SignSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return torch.sign(input)
+        
+    @staticmethod
+    def backward(ctx, grad_output):
+        #straight through estimator is unstable
+        #return grad_output
+        input, = ctx.saved_tensors
+        # try tanh derivative
+        return (1 - torch.square(torch.tanh(input))) * grad_output
+
+def ste_sign(input):
+    return SignSTE.apply(input)
+
 def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
     try:
@@ -166,20 +185,22 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = set()
 
         self.add_lth = config.add_lth
+        
         self.exp_nonlinear_transform = config.exp_nonlinear_transform
         if self.add_lth:
+            self.lth_use_only = config.lth_use_only
+            self.lth_mode = config.lth_mode
             self.lth_tempering = config.lth_tempering
             self.lth_start_temp = config.lth_start_temp
             self.lth_end_temp = config.lth_end_temp
             self.lth_temp_steps = config.lth_temp_steps      
             self.lth_step_counter = 0
             self.lth_temperature = config.lth_start_temp
-            if not self.lth_temperature and self.lth_temperature != 1:
+            if not self.lth_tempering and self.lth_temperature != 1:
                 print("WARNING: temperature set to {} while not tempering".format(self.lth_temperature))
 
 
             self.lth_int_dim = config.lth_int_dim
-            
             self.lth_final_dim = config.lth_final_dim
             self.lth_bit_thold = config.lth_bit_thold
             self.lth_intended_top_k = config.lth_intended_top_k
@@ -200,8 +221,8 @@ class GPT2Attention(nn.Module):
                 nn.Linear(self.lth_int_dim, self.num_heads * self.lth_final_dim)
             )
             if self.layer_idx == 0:
-                print("!!LTH params [enable:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
-                              self.add_lth, self.lth_hard_inference, self.lth_int_dim,
+                print("!!LTH params [enable:{} mode:{} hard:{}] int:{} final:{} thold:{} topk:{} ".format(
+                              self.add_lth, self.lth_mode, self.lth_hard_inference, self.lth_int_dim,
                               self.lth_final_dim,
                               self.lth_bit_thold, self.lth_intended_top_k ))
                 print("!!LTH params [tempering:{} start:{} end:{} steps:{}]  ".format(
@@ -237,6 +258,62 @@ class GPT2Attention(nn.Module):
             self.lth_temperature = new_temperature
         return self.lth_temperature
     
+    def give_lth_ste_hard_score(self, hidden_states, attention_mask):
+
+        Q = self.learning_to_hash_transformation_q(hidden_states)
+        K = self.learning_to_hash_transformation_k(hidden_states)
+
+        Q = ste_sign(Q)
+        K = ste_sign(K)
+        
+        Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
+        K = self._split_heads(K, self.num_heads, self.lth_final_dim)
+        bsz, _, q_seq_len, _ = Q.size()
+        _, _, k_seq_len, _ = K.size()
+
+        q = rearrange(Q, 'b h t d -> (b h) t d')
+        k = rearrange(K, 'b h s d -> (b h) d s')
+        # Preallocate attn_weights for `baddbmm`
+        span_scores = torch.empty(bsz * self.num_heads, q_seq_len, k_seq_len, dtype=Q.dtype,
+                                   device=Q.device)
+
+        span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
+                                 '(b h) t s -> b h t s', h=self.num_heads)
+        
+        span_scores = (1 + ste_sign(span_scores - self.lth_final_dim * self.lth_bit_thold))/2 + 1e-4
+        #span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True)) * self.lth_intended_top_k
+        
+        return span_scores
+    
+    def give_lth_ste_score(self, hidden_states):
+        Q = self.learning_to_hash_transformation_q(hidden_states)
+        K = self.learning_to_hash_transformation_k(hidden_states)
+
+        Q = ste_sign(Q)
+        K = ste_sign(K)
+        
+        Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
+        K = self._split_heads(K, self.num_heads, self.lth_final_dim)
+        bsz, _, q_seq_len, _ = Q.size()
+        _, _, k_seq_len, _ = K.size()
+
+        q = rearrange(Q, 'b h t d -> (b h) t d')
+        k = rearrange(K, 'b h s d -> (b h) d s')
+        # Preallocate attn_weights for `baddbmm`
+        span_scores = torch.empty(bsz * self.num_heads, q_seq_len, k_seq_len, dtype=Q.dtype,
+                                   device=Q.device)
+
+        span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
+                                 '(b h) t s -> b h t s', h=self.num_heads)
+        
+        #span_scores = (1 + ste_sign((span_scores - self.lth_final_dim * self.lth_bit_thold))) / 2 # backward pass will completely be biased towards first sample
+        span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold)) # let this be for backward pass
+        # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
+        span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
+        
+        span_scores = self.lth_intended_top_k * span_scores
+        return span_scores
+
     def give_lth_score(self, hidden_states):
         T = self.lth_temperature
         if self.training and self.lth_tempering:
@@ -244,7 +321,6 @@ class GPT2Attention(nn.Module):
 
         Q = self.learning_to_hash_transformation_q(hidden_states)
         K = self.learning_to_hash_transformation_k(hidden_states)
-
 
         if self.lth_hard_inference and (not self.training):
             Q = torch.sign(Q)
@@ -279,6 +355,42 @@ class GPT2Attention(nn.Module):
         span_scores = self.lth_intended_top_k * span_scores
         return span_scores
 
+    def give_lth_score_causal(self, hidden_states, attention_mask):
+        Q = self.learning_to_hash_transformation_q(hidden_states)
+        K = self.learning_to_hash_transformation_k(hidden_states)
+        Q = nn.functional.tanh(Q)
+        K = nn.functional.tanh(K)
+        
+        Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
+        K = self._split_heads(K, self.num_heads, self.lth_final_dim)
+        bsz, _, q_seq_len, _ = Q.size()
+        _, _, k_seq_len, _ = K.size()
+
+        q = rearrange(Q, 'b h t d -> (b h) t d')
+        k = rearrange(K, 'b h s d -> (b h) d s')
+        # Preallocate attn_weights for `baddbmm`
+
+        span_scores = torch.empty(bsz * self.num_heads, q_seq_len, k_seq_len, dtype=Q.dtype,
+                                   device=Q.device)
+
+        span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
+                                 '(b h) t s -> b h t s', h=self.num_heads)
+        if not self.is_cross_attention:
+            query_length, key_length = Q.size(-2), Q.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            mask_value = torch.finfo(span_scores.dtype).min
+            mask_value = torch.full([], mask_value, dtype=span_scores.dtype, device=span_scores.device)
+            span_scores = torch.where(causal_mask, span_scores.to(span_scores.dtype), mask_value)
+
+        if attention_mask is not None:
+            span_scores = span_scores + attention_mask
+        span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold))
+
+        # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
+        span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
+
+        span_scores = self.lth_intended_top_k * span_scores
+        return span_scores
 
 
     def prune_heads(self, heads):
@@ -296,7 +408,8 @@ class GPT2Attention(nn.Module):
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None, span_scores=None):
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None, span_scores=None, use_only_lth=False):
+
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
@@ -316,6 +429,8 @@ class GPT2Attention(nn.Module):
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype, device=attn_weights.device)
+            if self.add_lth and self.lth_mode == "ste_hard" and span_scores is not None:
+                attn_weights = attn_weights * span_scores
             attn_weights = torch.where(causal_mask, attn_weights.to(attn_weights.dtype), mask_value)
 
         if attention_mask is not None:
@@ -326,7 +441,14 @@ class GPT2Attention(nn.Module):
 
 
         if span_scores is not None:
-            attn_weights = torch.minimum(span_scores, attn_weights)
+            if self.add_lth and self.lth_mode == "ste_hard" and span_scores is not None:
+                attn_weights = attn_weights * span_scores
+            elif use_only_lth:
+                import pdb
+                pdb.set_trace()
+                attn_weights = span_scores
+            else:
+                attn_weights = torch.minimum(span_scores, attn_weights)
 
 
         # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
@@ -450,12 +572,23 @@ class GPT2Attention(nn.Module):
 
         span_scores = None
         if self.add_lth:
-            span_scores = self.give_lth_score(hidden_states)
-
+            if self.lth_mode == "tempering":
+                span_scores = self.give_lth_score(hidden_states)
+            elif self.lth_mode == "causal":
+                span_scores = self.give_lth_score_causal(hidden_states, attention_mask)
+            elif self.lth_mode == "ste":
+                span_scores = self.give_lth_ste_score(hidden_states)
+            elif self.lth_mode == "ste_hard":
+                span_scores = self.give_lth_ste_hard_score(hidden_states, attention_mask)
+            else:
+                raise NotImplemented
+            if self.lth_use_only:
+                assert self.lth_mode in ["causal"]
+            
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask, span_scores)
         else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask, span_scores)
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask, span_scores, use_only_lth=self.lth_use_only)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.c_proj(attn_output)

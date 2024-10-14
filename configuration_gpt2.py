@@ -160,6 +160,8 @@ class GPT2Config(PretrainedConfig):
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
         add_lth=False,
+        lth_use_only=False,
+        lth_mode="tempering",
         exp_nonlinear_transform=False,
         lth_int_dim=128,
         lth_final_dim=24,
@@ -194,6 +196,8 @@ class GPT2Config(PretrainedConfig):
         self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
         self.reorder_and_upcast_attn = reorder_and_upcast_attn
         self.add_lth=add_lth
+        self.lth_mode=lth_mode
+        self.lth_use_only=lth_use_only
         self.exp_nonlinear_transform=exp_nonlinear_transform
         self.lth_int_dim=lth_int_dim
         self.lth_final_dim=lth_final_dim
