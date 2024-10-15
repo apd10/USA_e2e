@@ -279,7 +279,7 @@ class GPT2Attention(nn.Module):
 
         span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
                                  '(b h) t s -> b h t s', h=self.num_heads)
-        
+                                 
         span_scores = (1 + ste_sign(span_scores - self.lth_final_dim * self.lth_bit_thold))/2 + 1e-4
         #span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True)) * self.lth_intended_top_k
         
@@ -313,6 +313,60 @@ class GPT2Attention(nn.Module):
         
         span_scores = self.lth_intended_top_k * span_scores
         return span_scores
+
+    def give_lth_score_adjusted(self, hidden_states):
+        T = self.lth_temperature
+        if self.training and self.lth_tempering:
+            T = self.get_lth_training_temp()
+
+        Q = self.learning_to_hash_transformation_q(hidden_states)
+        K = self.learning_to_hash_transformation_k(hidden_states)
+
+        if self.lth_hard_inference and (not self.training):
+            Q = torch.sign(Q)
+            K = torch.sign(K)
+        else:
+            Q = nn.functional.tanh(Q*T)
+            K = nn.functional.tanh(K*T)
+        
+        Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
+        K = self._split_heads(K, self.num_heads, self.lth_final_dim)
+        bsz, _, q_seq_len, _ = Q.size()
+        _, _, k_seq_len, _ = K.size()
+
+        q = rearrange(Q, 'b h t d -> (b h) t d')
+        k = rearrange(K, 'b h s d -> (b h) d s')
+        # Preallocate attn_weights for `baddbmm`
+        span_scores = torch.empty(bsz * self.num_heads, q_seq_len, k_seq_len, dtype=Q.dtype,
+                                   device=Q.device)
+
+        span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
+                                 '(b h) t s -> b h t s', h=self.num_heads)
+        
+        if self.lth_hard_inference and (not self.training):
+            span_scores = (span_scores - self.lth_final_dim * self.lth_bit_thold  > 0).type(span_scores.dtype)
+        else:
+            span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold)*T)
+        #else:
+
+        scaling = None
+
+        if not self.is_cross_attention:
+            query_length, key_length = Q.size(-2), Q.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            mask_value = 0
+            mask_value = torch.full([], mask_value, dtype=span_scores.dtype, device=span_scores.device)
+            span_scores = torch.where(causal_mask, span_scores.to(span_scores.dtype), mask_value)
+            scaling = torch.sum(causal_mask.type(span_scores.dtype), dim=-1, keepdim=True) / span_scores.shape[-1]
+
+        # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
+        span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
+        if scaling is not None:
+            span_scores = span_scores * scaling
+
+        span_scores = self.lth_intended_top_k * span_scores
+        return span_scores
+
 
     def give_lth_score(self, hidden_states):
         T = self.lth_temperature
@@ -413,8 +467,6 @@ class GPT2Attention(nn.Module):
         span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
                                  '(b h) t s -> b h t s', h=self.num_heads)
 
-        import pdb 
-        pdb.set_trace()
         if attention_mask is not None:
             span_scores = span_scores + attention_mask
         span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold))
@@ -480,7 +532,6 @@ class GPT2Attention(nn.Module):
             attn_weights = attn_weights + attention_mask
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
 
         if span_scores is not None:
             if self.add_lth and self.lth_mode == "ste_hard" and span_scores is not None:
@@ -614,6 +665,8 @@ class GPT2Attention(nn.Module):
         if self.add_lth:
             if self.lth_mode == "tempering":
                 span_scores = self.give_lth_score(hidden_states)
+            elif self.lth_mode == "tempering_scaled":
+                span_scores = self.give_lth_score_adjusted(hidden_states)
             elif self.lth_mode == "causal":
                 span_scores = self.give_lth_score_causal(hidden_states, attention_mask)
             elif self.lth_mode == "causal_unnorm":
@@ -625,7 +678,7 @@ class GPT2Attention(nn.Module):
             else:
                 raise NotImplemented
             if self.lth_use_only:
-                assert self.lth_mode in ["causal"]
+                assert self.lth_mode in ["causal", 'causal_unnorm']
             
         if self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask, span_scores)
