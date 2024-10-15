@@ -392,6 +392,48 @@ class GPT2Attention(nn.Module):
         span_scores = self.lth_intended_top_k * span_scores
         return span_scores
 
+    def give_lth_score_causal_fullnorm(self, hidden_states, attention_mask):
+        Q = self.learning_to_hash_transformation_q(hidden_states)
+        K = self.learning_to_hash_transformation_k(hidden_states)
+        Q = nn.functional.tanh(Q)
+        K = nn.functional.tanh(K)
+        
+        Q = self._split_heads(Q, self.num_heads, self.lth_final_dim)
+        K = self._split_heads(K, self.num_heads, self.lth_final_dim)
+        bsz, _, q_seq_len, _ = Q.size()
+        _, _, k_seq_len, _ = K.size()
+
+        q = rearrange(Q, 'b h t d -> (b h) t d')
+        k = rearrange(K, 'b h s d -> (b h) d s')
+        # Preallocate attn_weights for `baddbmm`
+
+        span_scores = torch.empty(bsz * self.num_heads, q_seq_len, k_seq_len, dtype=Q.dtype,
+                                   device=Q.device)
+
+        span_scores = rearrange(torch.baddbmm(span_scores, q, k, beta=0, alpha=1.0),
+                                 '(b h) t s -> b h t s', h=self.num_heads)
+
+        import pdb 
+        pdb.set_trace()
+        if attention_mask is not None:
+            span_scores = span_scores + attention_mask
+        span_scores = torch.sigmoid((span_scores - self.lth_final_dim * self.lth_bit_thold))
+
+        # TODO(some other way of ensuring the constraint? that ensures that we have topk near 1s)
+        span_scores = span_scores / (1e-20 + torch.sum(span_scores, dim=-1, keepdim=True))
+        span_scores = self.lth_intended_top_k * span_scores
+
+        if not self.is_cross_attention:
+            query_length, key_length = Q.size(-2), Q.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length]
+            mask_value = 0
+            mask_value = torch.full([], mask_value, dtype=span_scores.dtype, device=span_scores.device)
+            span_scores = torch.where(causal_mask, span_scores.to(span_scores.dtype), mask_value)
+        
+        return span_scores
+
+
+
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -444,8 +486,6 @@ class GPT2Attention(nn.Module):
             if self.add_lth and self.lth_mode == "ste_hard" and span_scores is not None:
                 attn_weights = attn_weights * span_scores
             elif use_only_lth:
-                import pdb
-                pdb.set_trace()
                 attn_weights = span_scores
             else:
                 attn_weights = torch.minimum(span_scores, attn_weights)
@@ -576,6 +616,8 @@ class GPT2Attention(nn.Module):
                 span_scores = self.give_lth_score(hidden_states)
             elif self.lth_mode == "causal":
                 span_scores = self.give_lth_score_causal(hidden_states, attention_mask)
+            elif self.lth_mode == "causal_unnorm":
+                span_scores = self.give_lth_score_causal_fullnorm(hidden_states, attention_mask)
             elif self.lth_mode == "ste":
                 span_scores = self.give_lth_ste_score(hidden_states)
             elif self.lth_mode == "ste_hard":
